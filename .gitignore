@@ -1,0 +1,23 @@
+# 构建产物（PyInstaller）
+dist/
+build/
+__pycache__/
+*.pyc
+*.pyo
+
+# 大型内嵌二进制（>50MB / 超 GitHub 限制）——通过 Release 分发，或打包时自备
+node
+ffmpeg
+ffprobe
+yt-dlp.dat
+*.bak
+*.x86_64
+
+# 本地运行时数据
+YTLdown_Data/
+.DS_Store
+_wtest.txt
+
+# IDE
+.idea/
+.vscode/
