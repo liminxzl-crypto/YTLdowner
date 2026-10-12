@@ -18,6 +18,13 @@ YTLdown_Data/
 .DS_Store
 _wtest.txt
 
+# 项目工作区数据（记忆/日志等，仅本地）
+.workbuddy/
+
+# 临时测试素材
+test_wechat.mp4
+*.tmp
+
 # IDE
 .idea/
 .vscode/

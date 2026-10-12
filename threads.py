@@ -11,9 +11,17 @@ import stat
 from config import (get_exe_path, get_bin_name, get_subprocess_kwargs, get_clean_env,
                     get_ytdlp_js_args, THUMB_DIR, BIN_DIR)
 import m3u8_sniffer
+import douyin_extractor
+import wx_channel_helper
 
 # 浏览器嗅探结果缓存：页面 URL -> SniffResult（解析阶段产出，下载阶段复用，避免重复开浏览器）
 M3U8_CACHE = {}
+# 抖音解析结果缓存：URL -> Dict
+DOUYIN_CACHE = {}
+# 微信视频号解析结果缓存：URL -> Dict
+CHANNELS_CACHE = {}
+# 任务解析全量元数据与最优策略缓存：URL -> Dict
+TASK_CACHE = {}
 
 
 def _proxy_from_args(cookie_args):
@@ -24,33 +32,45 @@ def _proxy_from_args(cookie_args):
     return None
 
 # ==========================================
-# 🌟 极速自适应 Cookie 智能轮询引擎
+# 🌟 极速自适应 Cookie 智能调度引擎（精准定向，杜绝 5 级耗时遍历）
 # ==========================================
-def generate_cookie_queue(preferred_args):
-    """核心算法：精准识别代理，无条件优先用户设置，无缝生成备用队列"""
-    # 1. 🌟 修复关键：无条件将用户的首选方案放在第一位！绝对尊重你的设置！
-    queue = [preferred_args]
-    
-    # 2. 🌟 提取代理配置（极其关键：保证切换备用方案时依然能翻墙，防止卡死）
+def generate_cookie_queue(preferred_args, for_download=False):
+    """
+    极速自适应策略：精准定向，杜绝 5 级盲目耗时轮询。
+    - 若用户已配置 Cookie（本地 TXT 或指定浏览器），优先且仅使用该策略。
+    - 若用户未配置 Cookie（免 Cookie 模式）：
+      1. 优先尝试 免 Cookie（带代理）；
+      2. 解析阶段若失败，仅快速回退 1 次本机首选主浏览器（Mac: Chrome/Safari, Win: Chrome/Edge）；
+      3. 下载阶段严格使用解析成功的策略，绝不重复回退！
+    """
     base_args = []
     if "--proxy" in preferred_args:
         idx = preferred_args.index("--proxy")
         if idx + 1 < len(preferred_args):
             base_args = ["--proxy", preferred_args[idx+1]]
-            
-    # 3. 准备备用武器库 (带着代理一起切换)
-    fallbacks = [
-        base_args + ["--cookies-from-browser", "chrome"],
-        base_args + ["--cookies-from-browser", "edge"],
-        base_args + ["--cookies-from-browser", "safari"],
-        base_args  # 终极兜底：无 Cookie
-    ]
-    
-    # 4. 去重并填装弹药
-    for f in fallbacks:
-        if f not in queue:
-            queue.append(f)
-            
+
+    # 1. 用户有明确配置（如导入了 txt 或指定了特定浏览器）
+    has_custom_cookie = "--cookies" in preferred_args or "--cookies-from-browser" in preferred_args
+    if has_custom_cookie:
+        queue = [preferred_args]
+        if not for_download:
+            queue.append(base_args)  # 仅带上免 cookie 快速兜底
+        return queue
+
+    # 2. 用户选择“免 Cookie”
+    queue = [base_args]
+    if not for_download:
+        # 仅智能追加 1 个本机最可能登录的浏览器，不追加全部 3 个！
+        main_browser = "chrome"
+        if sys.platform == "darwin":
+            if os.path.exists("/Applications/Google Chrome.app"):
+                main_browser = "chrome"
+            elif os.path.exists("/Applications/Microsoft Edge.app"):
+                main_browser = "edge"
+            else:
+                main_browser = "safari"
+        queue.append(base_args + ["--cookies-from-browser", main_browser])
+
     return queue
 
 def get_strategy_name(args):
@@ -82,8 +102,44 @@ def build_media_args(resolution="best", audio_only=False):
     return args
 
 
+# ==========================================
+# 🌟 YouTube 风控对抗：播放器客户端轮换
+# ==========================================
+def is_youtube_url(url):
+    u = (url or "").lower()
+    return ("youtube.com/" in u or "youtu.be/" in u
+            or "youtube-nocookie.com/" in u)
+
+
+def youtube_client_variants(url):
+    """返回 YouTube 的播放器客户端轮换表（每个元素是一组额外的 yt-dlp 参数）。
+
+    2026 起 YouTube 对“数据中心 / 代理出口 IP”大面积启用风控，典型症状：
+      - 解析正常、下载跑几 MB 后 `HTTP Error 403: Forbidden`；
+      - 或直接 `Sign in to confirm you're not a bot`；
+      - 或 `Some formats have been skipped ... SABR-only streaming experiment`。
+    换一个播放器客户端往往能拿到真正可下载的直链，因此按顺序轮换重试。
+    """
+    if not is_youtube_url(url):
+        return [[]]
+    return [
+        [],                                                          # 默认客户端
+        ["--extractor-args", "youtube:player_client=web_embedded"],
+    ]
+
+
+def _iter_log_markers(line, state):
+    """在 yt-dlp 输出里识别风控特征，写入 state。"""
+    low = line.lower()
+    if "sign in to confirm" in low or "not a bot" in low:
+        state["botcheck"] = True
+    if "http error 403" in low or "403: forbidden" in low:
+        state["forbidden"] = True
+    if "sabr-only streaming experiment" in low:
+        state["sabr"] = True
+
+
 def looks_like_playlist(url):
-    """粗判 URL 是否是“系列/播放列表/频道合集”（需要让用户选择整集或单集）。"""
     u = (url or "").lower()
     if "list=" in u:                      # YouTube / 多数站点通用 playlist 参数
         return True
@@ -187,13 +243,142 @@ class InfoThread(QThread):
         self.media_args = media_args or []
 
     def run(self):
+        proxy = _proxy_from_args(self.cookie_args)
+
+        # 🌟 1. 抖音专属极速解析引擎
+        if douyin_extractor.is_douyin_url(self.url):
+            self.log_signal.emit(f"🎵 检测到抖音内容链接，启动专属无水印原画解析引擎: {self.url}")
+            try:
+                extractor = douyin_extractor.DouyinExtractor(proxy=proxy)
+                info = extractor.parse(self.url)
+                if info:
+                    # 缓存解析结果
+                    DOUYIN_CACHE[self.url] = info
+                    DOUYIN_CACHE[info["url"]] = info
+                    if info.get("id"):
+                        DOUYIN_CACHE[info["id"]] = info
+
+                    title = info.get("title", "抖音作品")
+                    thumb_url = info.get("thumb", "")
+                    thumb_path = ""
+                    if thumb_url:
+                        import hashlib
+                        import urllib.request
+                        md5_name = hashlib.md5(self.url.encode()).hexdigest() + ".jpg"
+                        thumb_path = os.path.join(THUMB_DIR, md5_name)
+                        if not os.path.exists(thumb_path):
+                            try:
+                                req = urllib.request.Request(thumb_url, headers={'User-Agent': 'Mozilla/5.0'})
+                                with urllib.request.urlopen(req, timeout=5) as res, open(thumb_path, 'wb') as f:
+                                    f.write(res.read())
+                            except Exception:
+                                pass
+
+                    m_type_str = "【图集】" if info.get("media_type") == "image_album" else "【高清视频】"
+                    self.log_signal.emit(f"✅ 抖音解析成功 {m_type_str}: {title}")
+                    self.finished_signal.emit({"url": self.url, "title": f"{m_type_str} {title}", "thumb": thumb_path})
+                    return
+                else:
+                    self.log_signal.emit("⚠️ 抖音专属解析未能获取详情，尝试回退常规引擎...")
+            except Exception as e:
+                self.log_signal.emit(f"⚠️ 抖音专属解析异常: {e}，尝试回退常规引擎...")
+
+        # 🌟 2. 微信视频号专属解析 (支持 channels.weixin.qq.com 网页预览链接与嗅探直链)
+        if wx_channel_helper.is_wechat_channels_url(self.url):
+            self.log_signal.emit(f"🎬 检测到微信视频号内容链接，启动视频号专用提取器: {self.url}")
+            cached_ch = CHANNELS_CACHE.get(self.url)
+
+            # 短链 https://weixin.qq.com/sph/XXXX -> 真实预览页地址
+            page_url = self.url
+            if wx_channel_helper.is_wechat_channels_page_url(self.url):
+                resolved = wx_channel_helper.resolve_channels_short_url(self.url)
+                if resolved and resolved != self.url:
+                    page_url = resolved
+                    self.log_signal.emit(f"🔗 视频号短链已解析 -> {page_url}")
+
+            if not cached_ch:
+                cached_ch = CHANNELS_CACHE.get(page_url)
+
+            if not cached_ch and wx_channel_helper.is_wechat_channels_page_url(page_url):
+                try:
+                    cached_ch = wx_channel_helper.extract_channels_web_video(
+                        page_url,
+                        on_log=lambda m: self.log_signal.emit(m),
+                        timeout=12
+                    )
+                except Exception as e:
+                    self.log_signal.emit(f"⚠️ 视频号网页解析异常: {e}")
+
+            if cached_ch:
+                CHANNELS_CACHE[self.url] = cached_ch
+                if page_url:
+                    CHANNELS_CACHE[page_url] = cached_ch
+                if cached_ch.get("video_url"):
+                    CHANNELS_CACHE[cached_ch["video_url"]] = cached_ch
+
+            if cached_ch and cached_ch.get("video_url"):
+                title = cached_ch.get("title", "微信视频号视频")
+                thumb_url = cached_ch.get("thumb", "")
+                thumb_path = ""
+                if thumb_url:
+                    import hashlib
+                    import urllib.request
+                    md5_name = hashlib.md5(self.url.encode()).hexdigest() + ".jpg"
+                    thumb_path = os.path.join(THUMB_DIR, md5_name)
+                    if not os.path.exists(thumb_path):
+                        try:
+                            req = urllib.request.Request(thumb_url, headers={'User-Agent': 'Mozilla/5.0'})
+                            with urllib.request.urlopen(req, timeout=5) as res, open(thumb_path, 'wb') as f:
+                                f.write(res.read())
+                        except Exception:
+                            pass
+                TASK_CACHE[self.url] = {
+                    "title": title,
+                    "thumb": thumb_path,
+                    "cookie_args": [],
+                    "info": cached_ch
+                }
+                self.log_signal.emit(f"✅ 视频号解析成功: {title}")
+                self.finished_signal.emit({"url": self.url, "title": f"【视频号】{title}", "thumb": thumb_path})
+                return
+
+            # 走到这里说明：拿到了预览页元数据（或预览页根本没放流）。
+            # 视频号的网页预览版只给封面+文案，真正的视频流必须在微信内播放才能被捕获，
+            # 因此不要再回退到 yt-dlp 通用解析 + m3u8 嗅探（必然失败且要等 1 分钟）。
+            if wx_channel_helper.is_wechat_channels_page_url(page_url):
+                title = (cached_ch or {}).get("title") or "微信视频号视频"
+                thumb_url = (cached_ch or {}).get("thumb", "")
+                thumb_path = ""
+                if thumb_url:
+                    import hashlib
+                    import urllib.request
+                    md5_name = hashlib.md5(self.url.encode()).hexdigest() + ".jpg"
+                    thumb_path = os.path.join(THUMB_DIR, md5_name)
+                    if not os.path.exists(thumb_path):
+                        try:
+                            req = urllib.request.Request(thumb_url, headers={'User-Agent': 'Mozilla/5.0'})
+                            with urllib.request.urlopen(req, timeout=5) as res, open(thumb_path, 'wb') as f:
+                                f.write(res.read())
+                        except Exception:
+                            pass
+                self.log_signal.emit("ℹ️ 该链接是视频号的网页预览版，浏览器内只加载封面，")
+                self.log_signal.emit("   视频流被限制为“前往微信观看”，无法直接用直链下载。")
+                self.log_signal.emit("💡 正确姿势：在 PC 微信里打开这条视频号内容播放一次，")
+                self.log_signal.emit("   【抓取助手】会自动捕获真实流并自动入队。")
+                self.finished_signal.emit({
+                    "url": self.url,
+                    "title": f"【视频号·需微信内播放】{title}",
+                    "thumb": thumb_path
+                })
+                return
+
         yt_exe = get_exe_path(get_bin_name("yt-dlp"))
         if not os.path.exists(yt_exe):
             self.log_signal.emit(f"❌ 找不到引擎: {yt_exe}")
             self.finished_signal.emit({"url": self.url, "title": "获取失败", "thumb": ""})
             return
 
-        cookie_queue = generate_cookie_queue(self.cookie_args)
+        cookie_queue = generate_cookie_queue(self.cookie_args, for_download=False)
         
         for current_cookie in cookie_queue:
             strategy = get_strategy_name(current_cookie)
@@ -202,12 +387,15 @@ class InfoThread(QThread):
             cmd = [
                 yt_exe,
                 "--dump-json",
+                "--skip-download",
                 "--no-playlist",
-                # 解析阶段：较短超时，快速失败切换策略
-                "--socket-timeout", "10",
-                "--retries", "1",
-                "--fragment-retries", "3",
+                "--no-check-certificates",
+                # 解析阶段：超快超时，失败秒切
+                "--socket-timeout", "4",
+                "--retries", "0",
+                "--fragment-retries", "1",
                 "--no-colors",
+                "--extractor-args", "youtube:player_client=android,web",
             ] + get_ytdlp_js_args() + current_cookie + [self.url]
             
             try:
@@ -249,17 +437,32 @@ class InfoThread(QThread):
                             except Exception as e:
                                 pass # 封面失败不影响大局
                                 
+                    # 🌟 写入全量任务元数据与已验证成功策略缓存（供下载时 0 延迟秒开）
+                    TASK_CACHE[self.url] = {
+                        "title": title,
+                        "thumb": thumb_path,
+                        "cookie_args": current_cookie,
+                        "info": info
+                    }
                     self.log_signal.emit(f"✅ 解析成功: {title}")
                     self.finished_signal.emit({"url": self.url, "title": title, "thumb": thumb_path})
                     return # 🎉 首选方案成功，直接退出！绝不拖泥带水！
                 else:
-                    self.log_signal.emit(f"⚠️ [{strategy}] 授权被拒或网络超时，0.1秒内自动切换...")
+                    self.log_signal.emit(f"⚠️ [{strategy}] 响应超时或受限，快速切换备用策略...")
                     
             except Exception as e:
                 self.log_signal.emit(f"⚠️ 运行异常: {str(e)}，自动切换...")
 
         # 常规 yt-dlp 解析全部失败 -> 浏览器嗅探真实 m3u8（带鉴权参数）
         title = "解析失败 (需导入TXT)"
+        if is_youtube_url(self.url):
+            # YouTube 走 HLS 嗅探没有任何意义，直接给出针对性结论，不浪费一分钟开浏览器
+            self.log_signal.emit("❌ YouTube 解析被风控拦截（常见提示：Sign in to confirm you're not a bot）。")
+            self.log_signal.emit("💡 说明当前出口 IP 被判定为机房/机器人 IP，请：")
+            self.log_signal.emit("   1) 换一个原生/住宅 IP 的代理节点后重试；")
+            self.log_signal.emit("   2) 在【设置】里选择【导入本地 txt...】或【浏览器身份】带上登录 Cookie。")
+            self.finished_signal.emit({"url": self.url, "title": title, "thumb": ""})
+            return
         if m3u8_sniffer.is_sniffable(self.url) and m3u8_sniffer.find_browser():
             self.log_signal.emit("🛰️ 常规解析被风控拦截，启动浏览器智能嗅探真实视频流...")
             proxy = _proxy_from_args(self.cookie_args)
@@ -299,10 +502,135 @@ class SingleDownloadWorker(QThread):
         self.is_paused = False
         self.process = None
         self.final_downloaded_path = "" 
+        self.fail_hint = {}
 
     def run(self):
         from config import ensure_binaries_ready
+        import time
         ensure_binaries_ready()
+        proxy = _proxy_from_args(self.cookie_args)
+
+        # 🌟 1. 抖音专属下载管道（支持无水印原画视频与图集多图+BGM）
+        if douyin_extractor.is_douyin_url(self.url) or self.url in DOUYIN_CACHE:
+            parsed = DOUYIN_CACHE.get(self.url)
+            if not parsed:
+                self.output_signal.emit("🔍 正在提取抖音无水印视频流地址...")
+                try:
+                    extractor = douyin_extractor.DouyinExtractor(proxy=proxy)
+                    parsed = extractor.parse(self.url)
+                except Exception as e:
+                    self.output_signal.emit(f"⚠️ 抖音解析失败: {e}")
+
+            if parsed:
+                self.output_signal.emit(f"🚀 启动抖音专属无水印下载引擎: {parsed.get('title', '')}")
+                audio_only = "-x" in self.media_args
+                ok, path, err = douyin_extractor.download_douyin_media(
+                    parsed_info=parsed,
+                    save_dir=self.final_dir,
+                    temp_dir=self.temp_dir,
+                    on_progress=lambda pct, spd, d_b, t_b: self.progress_signal.emit(self.url, int(pct), spd, ""),
+                    on_log=lambda m: self.output_signal.emit(m),
+                    cancel_checker=lambda: self.is_paused,
+                    audio_only=audio_only
+                )
+                if ok:
+                    self._finish_ok(path)
+                    return
+                elif err == "paused":
+                    self._finish_paused()
+                    return
+                else:
+                    self.output_signal.emit(f"⚠️ 抖音专属下载失败 ({err})，尝试回退常规引擎...")
+
+        # 🌟 2. 微信视频号专属下载管道
+        if wx_channel_helper.is_wechat_channels_url(self.url) or self.url in CHANNELS_CACHE:
+            cached_ch = CHANNELS_CACHE.get(self.url)
+            if not cached_ch and wx_channel_helper.is_wechat_channels_page_url(self.url):
+                # 短链先解析成真实预览页地址，再查缓存
+                page_url = wx_channel_helper.resolve_channels_short_url(self.url)
+                cached_ch = CHANNELS_CACHE.get(page_url)
+                if not cached_ch and "channels.weixin.qq.com" in page_url:
+                    cached_ch = wx_channel_helper.extract_channels_web_video(page_url)
+                if cached_ch:
+                    CHANNELS_CACHE[self.url] = cached_ch
+
+            if cached_ch and cached_ch.get("video_url"):
+                target_video_url = cached_ch.get("video_url") or self.url
+                title = cached_ch.get("title", f"视频号_{int(time.time())}")
+                safe_title = re.sub(r'[\/:*?"<>|]', '_', title)[:100]
+                final_file = os.path.join(self.final_dir, f"{safe_title}.mp4")
+
+                if cached_ch.get("decode_key"):
+                    decode_key = cached_ch["decode_key"]
+                    self.output_signal.emit(f"🎬 启动微信视频号下载与本地 Isaac64 解密引擎 (Key: {decode_key})...")
+                    temp_file = os.path.join(self.temp_dir, f"wx_{int(time.time())}.tmp")
+                    ok, err = douyin_extractor._stream_download_file(
+                        target_video_url, temp_file,
+                        on_progress=lambda pct, spd, d_b, t_b: self.progress_signal.emit(self.url, int(pct), spd, ""),
+                        on_log=lambda m: self.output_signal.emit(m),
+                        cancel_checker=lambda: self.is_paused
+                    )
+                    if ok and os.path.exists(temp_file):
+                        self.output_signal.emit("🔐 正在进行微信视频号本地无损解密...")
+                        dec_ok = wx_channel_helper.decrypt_wechat_video(
+                            temp_file, final_file, decode_key,
+                            progress_callback=lambda pct: self.progress_signal.emit(self.url, int(pct), "解密中...", "")
+                        )
+                        # 解密函数返回成功 ≠ 产物可用：密钥失效/算法不符时会写出坏文件，
+                        # 必须校验 ftyp 头，否则会把无法播放的文件当成品交付。
+                        if dec_ok and wx_channel_helper.is_valid_mp4(final_file):
+                            try:
+                                os.remove(temp_file)
+                            except Exception:
+                                pass
+                            self._finish_ok(final_file)
+                            return
+                        self.output_signal.emit("⚠️ 视频号解密校验未通过（密钥可能已失效），已保留原始视频流。")
+                        try:
+                            if os.path.exists(final_file):
+                                os.remove(final_file)
+                        except Exception:
+                            pass
+                        if os.path.exists(temp_file):
+                            shutil.move(temp_file, final_file)
+                            self._finish_ok(final_file)
+                            return
+                    elif err == "paused":
+                        self._finish_paused()
+                        return
+                else:
+                    # 网页捕获的直链（带 token 的高清流）
+                    self.output_signal.emit(f"🎬 启动微信视频号高清流式下载: {title}...")
+                    temp_file = os.path.join(self.temp_dir, f"wx_{int(time.time())}.mp4")
+                    ok, err = douyin_extractor._stream_download_file(
+                        target_video_url, temp_file,
+                        on_progress=lambda pct, spd, d_b, t_b: self.progress_signal.emit(self.url, int(pct), spd, ""),
+                        on_log=lambda m: self.output_signal.emit(m),
+                        cancel_checker=lambda: self.is_paused
+                    )
+                    if ok and os.path.exists(temp_file) and os.path.getsize(temp_file) > 1024:
+                        if os.path.exists(final_file):
+                            os.remove(final_file)
+                        os.rename(temp_file, final_file)
+                        self._finish_ok(final_file)
+                        return
+                    elif err == "paused":
+                        self._finish_paused()
+                        return
+                    else:
+                        self.output_signal.emit(f"⚠️ 视频号直链下载失败 ({err})，尝试回退常规引擎...")
+            elif wx_channel_helper.is_wechat_channels_page_url(self.url):
+                # 预览页拿不到视频流：明确告知原因，不再浪费一分钟跑 yt-dlp + 嗅探
+                title = (cached_ch or {}).get("title") or "微信视频号视频"
+                self.output_signal.emit("=" * 40)
+                self.output_signal.emit(f"❌ 视频号网页预览版无法直接下载：{title}")
+                self.output_signal.emit("ℹ️ 该页面只加载封面图与文案，视频流被限制为“前往微信观看”。")
+                self.output_signal.emit("💡 正确做法：在 PC 微信里打开并播放这条视频号内容，")
+                self.output_signal.emit("   【抓取助手】会自动捕获真实直链并自动入队下载。")
+                self.output_signal.emit("=" * 40)
+                self.finished_signal.emit(self.url, False, "视频号需微信内抓取")
+                return
+
         yt_exe = get_exe_path(get_bin_name("yt-dlp"))
         ffmpeg_exe = BIN_DIR
 
@@ -330,9 +658,12 @@ class SingleDownloadWorker(QThread):
             M3U8_CACHE.pop(self.url, None)
             self.output_signal.emit("⚠️ 缓存直链失效，回退到常规解析...")
 
-        # 第一阶段：常规 yt-dlp（含 Cookie 智能轮询）
+        # 第一阶段：常规 yt-dlp（优先使用解析阶段已验证成功的策略，0 延迟直连）
+        cached_task = TASK_CACHE.get(self.url)
+        effective_cookie_args = cached_task.get("cookie_args") if (cached_task and "cookie_args" in cached_task) else self.cookie_args
+
         ok, path, err = self._ytdlp_download(yt_exe, ffmpeg_exe, self.url,
-                                             self.cookie_args, [])
+                                             effective_cookie_args, [])
         if ok:
             self._finish_ok(path)
             return
@@ -341,6 +672,10 @@ class SingleDownloadWorker(QThread):
             return
 
         # 第二阶段：常规方案全部失败 -> 浏览器嗅探真实 m3u8 直链后无缝重试
+        # YouTube 不是 HLS 站，浏览器嗅探必然空手而归，直接给出针对性建议，省掉一分钟等待。
+        if is_youtube_url(self.url):
+            self._finish_fail("youtube")
+            return
         if not m3u8_sniffer.is_sniffable(self.url):
             self._finish_fail()
             return
@@ -374,135 +709,182 @@ class SingleDownloadWorker(QThread):
     def _ytdlp_download(self, yt_exe, ffmpeg_exe, target_url, cookie_args,
                         extra_args, direct=False):
         """运行一轮 yt-dlp 下载。返回 (success, final_path, err)。"""
-        cookie_queue = generate_cookie_queue(cookie_args) if not direct else [[]]
+        cookie_queue = generate_cookie_queue(cookie_args, for_download=True) if not direct else [[]]
+        # YouTube 风控对抗：换播放器客户端往往能拿到可下载的直链
+        client_variants = [[]] if direct else youtube_client_variants(target_url)
         success = False
         final_error = ""
         sys_encoding = locale.getpreferredencoding()
+        seen_parts = set()
+        hint = {}
 
-        for current_cookie in cookie_queue:
-            if self.is_paused:
+        for vi, client_args in enumerate(client_variants):
+            if success or self.is_paused:
                 break
-
-            if not direct:
-                strategy = get_strategy_name(current_cookie)
-                self.output_signal.emit(
-                    f"🔄 引擎正在启动，当前采用授权策略: 【{strategy}】...")
-            else:
-                self.output_signal.emit("🔄 使用嗅探到的直链下载中...")
-
-            self.final_downloaded_path = ""
-
-            audio_only = "-x" in self.media_args
-            cmd = [
-                yt_exe,
-                "--continue",
-            ]
-            if audio_only:
-                # 仅音频：让 yt-dlp 选最佳音频流，后处理转 mp3
-                cmd += ["-f", "bestaudio/best",
-                        "-x", "--audio-format", "mp3", "--audio-quality", "0"]
-            elif "-f" in self.media_args:
-                # 用户指定了分辨率上限
-                fi = self.media_args.index("-f")
-                cmd += ["-f", self.media_args[fi+1],
-                        "--merge-output-format", "mp4"]
-            else:
-                cmd += ["-f", "bv*[ext=mp4]+ba[ext=m4a]/bv*[ext=mp4]+ba/bv*+ba/b",
-                        "--merge-output-format", "mp4"]
-            cmd += [
-                "-P", f"home:{self.final_dir}",
-                "-P", f"temp:{self.temp_dir}",
-                "-o", "%(title)s.%(ext)s",
-                "--ffmpeg-location", ffmpeg_exe,
-                "--newline",
-                "--user-agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                "--no-colors",
-                "--retries", "infinite",
-                "--fragment-retries", "infinite",
-                "--file-access-retries", "10",
-                "--extractor-retries", "5",
-                "--retry-sleep", "3",
-                "--socket-timeout", "30",
-            ] + get_ytdlp_js_args()
-
-            if "xinpianchang.com" in target_url:
-                cmd.extend(["--add-header", "Referer:https://www.xinpianchang.com/"])
-                cmd.extend(["--add-header", "Origin:https://www.xinpianchang.com"])
-
-            cmd += list(extra_args)
-            cmd += current_cookie + [target_url]
-
-            try:
-                self.process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    env=get_clean_env(),
-                    **get_subprocess_kwargs()
-                )
-
-                for raw_line in iter(self.process.stdout.readline, b''):
-                    if self.is_paused:
+            if vi > 0:
+                name = ""
+                for i, a in enumerate(client_args):
+                    if a == "--extractor-args":
+                        name = client_args[i + 1]
                         break
-                    try:
-                        line = raw_line.decode('utf-8').strip()
-                    except UnicodeDecodeError:
-                        line = raw_line.decode(sys_encoding, errors='ignore').strip()
-                    if not line:
-                        continue
-                    if "Retrying" in line or "giving up" in line:
-                        self.output_signal.emit(f"🔄 重试: {line}")
-                    else:
-                        self.output_signal.emit(line)
+                self.output_signal.emit(f"🎚️ 更换播放器客户端重试（绕过风控）: {name}")
 
-                    dest_match = re.search(r'\[download\] Destination: (.+)', line)
-                    if dest_match:
-                        pc = dest_match.group(1).strip()
-                        if not pc.endswith(('.part', '.ytdl', '.temp')):
-                            self.final_downloaded_path = pc
-
-                    m_merger = re.search(r'\[Merger\] Merging formats into "([^"]+)"', line)
-                    m_move = re.search(r'\[MoveFiles\] Moving file "[^"]+" to "([^"]+)"', line)
-                    m_already = re.search(r'\[download\] (.*?) has already been downloaded', line)
-                    m_ffmpeg = re.search(r'\[ffmpeg\] Destination: (.+)', line)
-                    m_remux = re.search(r'\[VideoRemuxer\] Remuxing video from .* to "([^"]+)"', line)
-                    if m_merger: self.final_downloaded_path = m_merger.group(1)
-                    elif m_move: self.final_downloaded_path = m_move.group(1)
-                    elif m_already: self.final_downloaded_path = m_already.group(1).strip().strip('"')
-                    elif m_ffmpeg: self.final_downloaded_path = m_ffmpeg.group(1).strip().strip('"')
-                    elif m_remux: self.final_downloaded_path = m_remux.group(1)
-
-                    prog_match = re.search(r'\[download\]\s+([\d\.]+)%', line)
-                    if prog_match:
-                        pv = int(float(prog_match.group(1)))
-                        speed, eta = "计算中...", "计算中..."
-                        sm = re.search(r'at\s+([~\d\.]+[a-zA-Z]+/s)', line)
-                        if sm: speed = sm.group(1)
-                        em = re.search(r'ETA\s+([\d:]+)', line)
-                        if em: eta = em.group(1)
-                        elif "100%" in line: eta = "00:00"
-                        self.progress_signal.emit(self.url, pv, speed, eta)
-                    elif "[Merger]" in line or "Merging formats" in line:
-                        self.progress_signal.emit(self.url, 99, "合成中...", "即将完成")
-
-                self.process.wait()
+            for current_cookie in cookie_queue:
                 if self.is_paused:
-                    final_error = "paused"
                     break
-                elif self.process.returncode == 0:
-                    success = True
-                    break
-                else:
-                    if not direct:
-                        self.output_signal.emit(f"⚠️ 【{strategy}】失败 (代码 {self.process.returncode})，自动切换下一方案...")
-                    final_error = f"error_{self.process.returncode}"
-            except Exception as e:
-                if not self.is_paused:
-                    self.output_signal.emit(f"⚠️ 发生错误: {str(e)}，自动重试...")
-            finally:
-                self.process = None
 
+                if not direct:
+                    strategy = get_strategy_name(current_cookie)
+                    self.output_signal.emit(
+                        f"🔄 引擎正在启动，当前采用授权策略: 【{strategy}】...")
+                else:
+                    self.output_signal.emit("🔄 使用嗅探到的直链下载中...")
+
+                self.final_downloaded_path = ""
+                attempt_state = {"botcheck": False, "forbidden": False, "sabr": False}
+
+                audio_only = "-x" in self.media_args
+                cmd = [
+                    yt_exe,
+                    "--continue",
+                ]
+                if audio_only:
+                    # 仅音频：让 yt-dlp 选最佳音频流，后处理转 mp3
+                    cmd += ["-f", "bestaudio/best",
+                            "-x", "--audio-format", "mp3", "--audio-quality", "0"]
+                elif "-f" in self.media_args:
+                    # 用户指定了分辨率上限
+                    fi = self.media_args.index("-f")
+                    cmd += ["-f", self.media_args[fi+1],
+                            "--merge-output-format", "mp4"]
+                else:
+                    cmd += ["-f", "bv*[ext=mp4]+ba[ext=m4a]/bv*[ext=mp4]+ba/bv*+ba/b",
+                            "--merge-output-format", "mp4"]
+                cmd += [
+                    "-P", f"home:{self.final_dir}",
+                    "-P", f"temp:{self.temp_dir}",
+                    "-o", "%(title)s.%(ext)s",
+                    "--ffmpeg-location", ffmpeg_exe,
+                    "--newline",
+                    "--user-agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                    "--no-colors",
+                    "--retries", "infinite",
+                    "--fragment-retries", "infinite",
+                    "--file-access-retries", "10",
+                    "--extractor-retries", "5",
+                    "--retry-sleep", "3",
+                    "--socket-timeout", "30",
+                ] + get_ytdlp_js_args() + list(client_args)
+
+                if "xinpianchang.com" in target_url:
+                    cmd.extend(["--add-header", "Referer:https://www.xinpianchang.com/"])
+                    cmd.extend(["--add-header", "Origin:https://www.xinpianchang.com"])
+
+                cmd += list(extra_args)
+                cmd += current_cookie + [target_url]
+
+                try:
+                    self.process = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        env=get_clean_env(),
+                        **get_subprocess_kwargs()
+                    )
+
+                    for raw_line in iter(self.process.stdout.readline, b''):
+                        if self.is_paused:
+                            break
+                        try:
+                            line = raw_line.decode('utf-8').strip()
+                        except UnicodeDecodeError:
+                            line = raw_line.decode(sys_encoding, errors='ignore').strip()
+                        if not line:
+                            continue
+                        _iter_log_markers(line, attempt_state)
+                        if "Retrying" in line or "giving up" in line:
+                            self.output_signal.emit(f"🔄 重试: {line}")
+                        else:
+                            self.output_signal.emit(line)
+
+                        dest_match = re.search(r'\[download\] Destination: (.+)', line)
+                        if dest_match:
+                            pc = dest_match.group(1).strip()
+                            if pc.endswith(('.part', '.ytdl', '.temp')):
+                                seen_parts.add(pc)
+                            else:
+                                self.final_downloaded_path = pc
+                                seen_parts.add(pc + ".part")
+
+                        m_merger = re.search(r'\[Merger\] Merging formats into "([^"]+)"', line)
+                        m_move = re.search(r'\[MoveFiles\] Moving file "[^"]+" to "([^"]+)"', line)
+                        m_already = re.search(r'\[download\] (.*?) has already been downloaded', line)
+                        m_ffmpeg = re.search(r'\[ffmpeg\] Destination: (.+)', line)
+                        m_remux = re.search(r'\[VideoRemuxer\] Remuxing video from .* to "([^"]+)"', line)
+                        if m_merger: self.final_downloaded_path = m_merger.group(1)
+                        elif m_move: self.final_downloaded_path = m_move.group(1)
+                        elif m_already: self.final_downloaded_path = m_already.group(1).strip().strip('"')
+                        elif m_ffmpeg: self.final_downloaded_path = m_ffmpeg.group(1).strip().strip('"')
+                        elif m_remux: self.final_downloaded_path = m_remux.group(1)
+
+                        prog_match = re.search(r'\[download\]\s+([\d\.]+)%', line)
+                        if prog_match:
+                            pv = int(float(prog_match.group(1)))
+                            speed, eta = "计算中...", "计算中..."
+                            sm = re.search(r'at\s+([~\d\.]+[a-zA-Z]+/s)', line)
+                            if sm: speed = sm.group(1)
+                            em = re.search(r'ETA\s+([\d:]+)', line)
+                            if em: eta = em.group(1)
+                            elif "100%" in line: eta = "00:00"
+                            self.progress_signal.emit(self.url, pv, speed, eta)
+                        elif "[Merger]" in line or "Merging formats" in line:
+                            self.progress_signal.emit(self.url, 99, "合成中...", "即将完成")
+
+                    self.process.wait()
+                    if self.is_paused:
+                        final_error = "paused"
+                        break
+                    elif self.process.returncode == 0:
+                        success = True
+                        break
+                    else:
+                        if not direct:
+                            self.output_signal.emit(f"⚠️ 【{strategy}】失败 (代码 {self.process.returncode})，自动切换下一方案...")
+                        final_error = f"error_{self.process.returncode}"
+                        if attempt_state["botcheck"]:
+                            hint["botcheck"] = True
+                        elif attempt_state["forbidden"]:
+                            hint["forbidden"] = True
+                        if attempt_state["sabr"]:
+                            hint["sabr"] = True
+                        if attempt_state["botcheck"] or attempt_state["forbidden"]:
+                            # 直链已被风控作废：带着旧 .part 续传只会立刻再吃一次 403，
+                            # 因此清掉失败分片，换下一个播放器客户端重新取直链。
+                            self._drop_partial_files(seen_parts)
+                            if len(client_variants) > 1:
+                                break
+                except Exception as e:
+                    if not self.is_paused:
+                        self.output_signal.emit(f"⚠️ 发生错误: {str(e)}，自动重试...")
+                finally:
+                    self.process = None
+
+        self.fail_hint = hint
         return success, self.final_downloaded_path, final_error
+
+    def _drop_partial_files(self, paths):
+        """删除失败尝试残留的分片文件（仅限本次任务记录过的路径）。"""
+        removed = []
+        for p in paths:
+            try:
+                if p and os.path.exists(p):
+                    os.remove(p)
+                    removed.append(os.path.basename(p))
+            except Exception:
+                pass
+        if removed:
+            self.output_signal.emit(
+                f"🧹 已清理失效分片 {len(removed)} 个（{', '.join(removed[:3])}），将重新拉取直链。")
 
     def _finish_ok(self, path):
         self.output_signal.emit(f"🎉 任务完美结束: {self.url}")
@@ -513,11 +895,28 @@ class SingleDownloadWorker(QThread):
         self.output_signal.emit(f"⏸️ 任务已暂停: {self.url}")
         self.finished_signal.emit(self.url, False, "paused")
 
-    def _finish_fail(self):
-        self.output_signal.emit("="*40)
-        self.output_signal.emit("❌ 下载失败：常规解析与浏览器嗅探均未能取得可用视频流。")
-        self.output_signal.emit("💡 可尝试：开启代理、导入目标站 Cookie(TXT)，或确认该视频需要登录/付费。")
-        self.output_signal.emit("="*40)
+    def _finish_fail(self, kind=None):
+        self.output_signal.emit("=" * 40)
+        hint = getattr(self, "fail_hint", {}) or {}
+        if kind == "youtube" or is_youtube_url(self.url):
+            self.output_signal.emit("❌ YouTube 下载失败：已轮换过默认 / web_embedded 两种播放器客户端，仍拿不到可用直链。")
+            if hint.get("botcheck"):
+                self.output_signal.emit("🚩 关键线索：YouTube 返回 “Sign in to confirm you're not a bot”，")
+                self.output_signal.emit("   说明当前出口 IP 被判定为机器人/机房 IP。")
+            elif hint.get("forbidden"):
+                self.output_signal.emit("🚩 关键线索：直链刚下几 MB 就被 403 掐断，")
+                self.output_signal.emit("   这是 YouTube 对机房/代理 IP 的限速+封禁策略。")
+            elif hint.get("sabr"):
+                self.output_signal.emit("🚩 关键线索：YouTube 开启了 SABR-only 实验，高清直链不再下发。")
+            self.output_signal.emit("💡 按顺序试这几招（从便宜到彻底）：")
+            self.output_signal.emit("   1) 换一个代理节点（尽量选“原生/住宅 IP”节点，不要用机房节点），再重试；")
+            self.output_signal.emit("   2) 设置里改用【导入本地 TXT】或【浏览器身份】带上登录 Cookie；")
+            self.output_signal.emit("   3) 把画质上限从 2160p 降到 1080p，4K/AV1 流更容易被限速；")
+            self.output_signal.emit("   4) 在“工具箱”里升级 yt-dlp 到最新版（当前版本已超过 90 天）。")
+        else:
+            self.output_signal.emit("❌ 下载失败：常规解析与浏览器嗅探均未能取得可用视频流。")
+            self.output_signal.emit("💡 可尝试：开启代理、导入目标站 Cookie(TXT)，或确认该视频需要登录/付费。")
+        self.output_signal.emit("=" * 40)
         self.finished_signal.emit(self.url, False, "风控拦截")
 
     def pause(self):
@@ -566,8 +965,12 @@ class UpgradeWorker(QThread):
     # ----------------------------------------------------------------
     # 下载辅助：从 GitHub API 获取最新 release 的下载链接
     # ----------------------------------------------------------------
-    def _github_download(self, repo, asset_name, dest_path, timeout=120):
-        """从 GitHub 最新 release 下载指定 asset（支持代理），返回 True/False"""
+    def _github_download(self, repo, asset_name, dest_path, timeout=300):
+        """从 GitHub 最新 release 下载指定 asset（支持代理），返回 True/False。
+
+        采用分块流式写入：yt-dlp 的 macOS 通用二进制约 35MB，
+        一次性 resp.read() 在网络较慢时既没有进度反馈也容易超时失败。
+        """
         import urllib.request
         import json as _json
         from config import _get_proxy_opener
@@ -600,8 +1003,27 @@ class UpgradeWorker(QThread):
             "Accept": "application/octet-stream"
         })
         with (opener.open(dl_req, timeout=timeout) if opener else urllib.request.urlopen(dl_req, timeout=timeout)) as resp:
+            total = 0
+            try:
+                total = int(resp.headers.get("Content-Length") or 0)
+            except Exception:
+                total = 0
+            got = 0
+            last_pct = -10
             with open(dest_path, "wb") as f:
-                f.write(resp.read())
+                while True:
+                    chunk = resp.read(1024 * 256)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    got += len(chunk)
+                    if total:
+                        pct = int(got * 100 / total)
+                        if pct - last_pct >= 10:
+                            last_pct = pct
+                            self.log_signal.emit(
+                                f"   … {pct}% ({got/1048576:.1f}/{total/1048576:.1f} MB)")
+            self.log_signal.emit(f"✅ 下载完成 ({got/1048576:.1f} MB)")
         return True
 
     # ----------------------------------------------------------------

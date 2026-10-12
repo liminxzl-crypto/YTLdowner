@@ -27,6 +27,8 @@ import urllib.request
 
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+MOBILE_UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 "
+             "(KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1")
 
 
 # ----------------------------------------------------------------------
@@ -258,6 +260,8 @@ def sniff_m3u8(url, on_log=None, timeout=45, proxy=None, settle_seconds=2.5):
 
     port = _free_port()
     udd = tempfile.mkdtemp(prefix="ytl-cdp-")
+    low_url = url.lower()
+    selected_ua = MOBILE_UA if ("channels.weixin.qq.com" in low_url or "weixin.qq.com" in low_url or "sph" in low_url or "finder" in low_url) else UA
     args = [
         browser,
         "--headless=new",
@@ -270,7 +274,7 @@ def sniff_m3u8(url, on_log=None, timeout=45, proxy=None, settle_seconds=2.5):
         "--disable-background-networking",
         "--disable-extensions",
         "--autoplay-policy=no-user-gesture-required",
-        f"--user-agent={UA}",
+        f"--user-agent={selected_ua}",
     ]
     if proxy:
         args.append(f"--proxy-server={proxy}")
@@ -427,12 +431,14 @@ def _http_get_text(url, timeout=15, proxy=None):
 def _resolve_media_url(m3u8_url, log, proxy=None, hops=3):
     """有些站点（如咪咕 GSLB）抓到的地址响应体不是 m3u8，而是一行真实媒体 URL。
     跟随这种“正文跳转”，直到拿到真正以 #EXTM3U 开头的播放列表。"""
+    low = m3u8_url.lower()
+    if ".mp4" in low or "stodownload" in low or "finder.video.qq.com" in low:
+        return m3u8_url
     cur = m3u8_url
     for _ in range(hops):
         try:
             text, final = _http_get_text(cur, proxy=proxy)
         except Exception as e:
-            log(f"⚠️ 校验 m3u8 失败: {e}")
             return cur
         body = text.strip()
         if body.startswith("#EXTM3U"):
@@ -448,9 +454,19 @@ def _resolve_media_url(m3u8_url, log, proxy=None, hops=3):
     return cur
 
 
+def _looks_like_media(u):
+    low = u.lower()
+    base = low.split("?")[0]
+    if base.endswith((".m3u8", ".mp4", ".flv", ".ts", ".webm")):
+        return True
+    if ".m3u8?" in low or ".m3u8&" in low or ".mp4?" in low:
+        return True
+    if "finder.video.qq.com" in low or "stodownload" in low:
+        return True
+    return False
+
 def _looks_like_m3u8(u):
-    base = u.lower().split("?")[0]
-    return base.endswith(".m3u8") or ".m3u8?" in u.lower() or ".m3u8&" in u.lower()
+    return _looks_like_media(u)
 
 
 def _free_port():

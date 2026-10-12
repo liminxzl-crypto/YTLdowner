@@ -16,8 +16,12 @@ from config import (BASE_DIR, QUEUE_FILE, CONFIG_FILE, get_tool_version, get_lat
 from ui_mainwindow import Ui_MainWindow
 from widgets import TaskWidget
 from threads import (InfoThread, SingleDownloadWorker, UpgradeWorker,
-                        PlaylistExpandThread, build_media_args, looks_like_playlist)
+                        PlaylistExpandThread, build_media_args, looks_like_playlist,
+                        CHANNELS_CACHE, DOUYIN_CACHE)
 from help_dialog import HelpDialog
+import douyin_extractor
+from wx_channel_helper import (WeChatChannelsServiceManager, ChannelsListenerThread,
+                               ChannelsStartWorker, is_wechat_channels_url)
 
 # ==========================================
 # 🌟 组件版本缓存（跨对话框实例持久化，避免重复查询）
@@ -136,6 +140,16 @@ class PreferencesDialog(QDialog):
         self.chk_shutdown = QCheckBox("📴 所有任务彻底完成后，自动关闭计算机")
         self.chk_shutdown.setChecked(self.config.get("shutdown_enabled", False))
         layout.addWidget(self.chk_shutdown)
+
+        # 🌟 抖音与视频号特性
+        feature_layout = QHBoxLayout()
+        self.chk_douyin_bgm = QCheckBox("🎵 抖音图集自动附带 BGM 音频")
+        self.chk_douyin_bgm.setChecked(self.config.get("douyin_bgm", True))
+        self.chk_channels_autostart = QCheckBox("🎬 开启视频号自动入队")
+        self.chk_channels_autostart.setChecked(self.config.get("channels_autostart", True))
+        feature_layout.addWidget(self.chk_douyin_bgm)
+        feature_layout.addWidget(self.chk_channels_autostart)
+        layout.addLayout(feature_layout)
         # ==========================================
         # 🌟 组件升级区
         # ==========================================
@@ -245,6 +259,8 @@ class PreferencesDialog(QDialog):
         res_values = ["best", "2160", "1440", "1080", "720", "480", "360"]
         self.config["resolution"] = res_values[self.res_combo.currentIndex()]
         self.config["audio_only"] = self.chk_audio.isChecked()
+        self.config["douyin_bgm"] = self.chk_douyin_bgm.isChecked()
+        self.config["channels_autostart"] = self.chk_channels_autostart.isChecked()
         return self.config
 
     def closeEvent(self, event):
@@ -371,10 +387,12 @@ class MainWindow(QMainWindow):
         self.task_widgets = {} 
         self.is_queue_running = False 
         self.running_info_threads = []
-        self.version = "1.3.0" 
+        self.version = "1.4.0"
         
         self.is_force_quit = False
         self._last_clipboard_text = ""
+        self.channels_service = WeChatChannelsServiceManager.get_instance()
+        self.channels_listener = None
 
         self.config = {
             "final_save_path": os.path.join(os.path.expanduser("~"), "Videos"),
@@ -444,11 +462,33 @@ class MainWindow(QMainWindow):
 
     def force_quit(self):
         self.is_force_quit = True
+        if self.channels_listener:
+            try:
+                self.channels_listener.stop()
+                self.channels_listener.wait(500)
+            except Exception:
+                pass
+        if self.channels_service:
+            try:
+                self.channels_service.stop_service()
+            except Exception:
+                pass
         self.tray_icon.hide() 
         QApplication.quit()
 
     def closeEvent(self, event):
         if self.is_force_quit:
+            if self.channels_listener:
+                try:
+                    self.channels_listener.stop()
+                    self.channels_listener.wait(500)
+                except Exception:
+                    pass
+            if self.channels_service:
+                try:
+                    self.channels_service.stop_service()
+                except Exception:
+                    pass
             if self.active_workers:
                 for w in self.active_workers.values(): w.pause()
             self.manual_save()
@@ -463,10 +503,32 @@ class MainWindow(QMainWindow):
             if self.active_workers:
                 reply = QMessageBox.question(self, '确认退出', "任务正在下载，确定要中断并暂停吗？", QMessageBox.Yes | QMessageBox.No)
                 if reply == QMessageBox.Yes:
+                    if self.channels_listener:
+                        try:
+                            self.channels_listener.stop()
+                            self.channels_listener.wait(500)
+                        except Exception:
+                            pass
+                    if self.channels_service:
+                        try:
+                            self.channels_service.stop_service()
+                        except Exception:
+                            pass
                     for w in self.active_workers.values(): w.pause()
                     self.manual_save(); event.accept()
                 else: event.ignore()
             else:
+                if self.channels_listener:
+                    try:
+                        self.channels_listener.stop()
+                        self.channels_listener.wait(500)
+                    except Exception:
+                        pass
+                if self.channels_service:
+                    try:
+                        self.channels_service.stop_service()
+                    except Exception:
+                        pass
                 self.manual_save(); event.accept()
 
     def bind_events(self):
@@ -479,6 +541,10 @@ class MainWindow(QMainWindow):
         self.ui.action_export.triggered.connect(self.export_queue)
         self.ui.action_exit.triggered.connect(self.force_quit) 
         
+        # 🌟 视频号助手联动
+        self.ui.btn_channels_helper.clicked.connect(self.toggle_channels_helper)
+        self.ui.action_toggle_channels.triggered.connect(self.toggle_channels_helper)
+
         self.ui.action_help_doc.triggered.connect(self.show_help_doc)
         self.ui.action_about.triggered.connect(self.show_about)
 
@@ -486,6 +552,72 @@ class MainWindow(QMainWindow):
         self._clipboard_timer = QTimer(self)
         self._clipboard_timer.timeout.connect(self.check_clipboard)
         self._clipboard_timer.start(1000)
+
+    def toggle_channels_helper(self):
+        """开启或关闭微信视频号抓取助手"""
+        if self.channels_listener and self.channels_listener.isRunning():
+            # ---- 停止 ----
+            self.channels_listener.stop()
+            self.channels_listener.wait(1500)
+            self.channels_listener = None
+            self.channels_service.stop_service()
+            self.ui.btn_channels_helper.setChecked(False)
+            self.ui.btn_channels_helper.setText("🎬 视频号助手")
+            self.ui.btn_channels_helper.setStyleSheet("""
+                QPushButton { background-color: #4b6584; color: white; font-weight: bold; border-radius: 6px; }
+            """)
+            self.update_log("🛑 微信视频号助手已停止，系统代理已还原。")
+        else:
+            # ---- 启动（内核首次使用需联网自举，放后台线程避免卡 UI）----
+            self.ui.btn_channels_helper.setEnabled(False)
+            self.ui.btn_channels_helper.setChecked(True)
+            self.ui.btn_channels_helper.setText("🎬 正在启动…")
+            self.update_log("🎬 正在准备视频号抓取内核…（首次使用会自动下载内核，请稍候）")
+            self._channels_starter = ChannelsStartWorker(self.channels_service)
+            self._channels_starter.log_signal.connect(self.update_log)
+            self._channels_starter.done_signal.connect(self._on_channels_started)
+            self._channels_starter.start()
+
+    def _on_channels_started(self, ok, msg):
+        """内核启动回调：只有真正启动成功，才挂上监听线程。"""
+        self.ui.btn_channels_helper.setEnabled(True)
+
+        if not ok:
+            self.update_log(f"❌ {msg}")
+            self.ui.btn_channels_helper.setChecked(False)
+            self.ui.btn_channels_helper.setText("🎬 视频号助手")
+            self.ui.btn_channels_helper.setStyleSheet("""
+                QPushButton { background-color: #4b6584; color: white; font-weight: bold; border-radius: 6px; }
+            """)
+            QMessageBox.warning(
+                self, "视频号助手启动失败",
+                f"{msg}\n\n提示：首次使用需要联网下载视频号内核。\n"
+                "若网络受限，请先在「首选项」中配置可用代理后重试。"
+            )
+            return
+
+        self.update_log(f"✅ {msg}")
+        self.channels_listener = ChannelsListenerThread()
+        self.channels_listener.log_signal.connect(self.update_log)
+        self.channels_listener.video_captured.connect(self.on_channels_video_captured)
+        self.channels_listener.start()
+
+        self.ui.btn_channels_helper.setChecked(True)
+        self.ui.btn_channels_helper.setText("🎬 视频号监听中")
+        self.ui.btn_channels_helper.setStyleSheet("""
+            QPushButton { background-color: #20bf6b; color: white; font-weight: bold; border-radius: 6px; }
+        """)
+        self.update_log("💡 视频号助手已就绪：在电脑微信中打开/播放视频号，将自动捕获并加入下载队列！")
+
+    def on_channels_video_captured(self, item: dict):
+        """视频号捕获到新视频回调"""
+        url = item.get("url") or item.get("video_url")
+        if not url:
+            return
+        CHANNELS_CACHE[url] = item
+        title = item.get("title", "微信视频号作品")
+        self.update_log(f"📥 自动捕获视频号视频: {title}，正在加入队列...")
+        self._enqueue_url(url)
 
     def update_log(self, text):
         self.ui.log_output.append(text)
@@ -507,8 +639,8 @@ class MainWindow(QMainWindow):
         QMessageBox.about(self, "关于 YTLdowner", 
                           f"YTLdowner {self.os_name} v{self.version}\n\n"
                           "专业级双端视频下载工作站。\n"
-                          "基于 yt-dlp & FFmpeg 引擎驱动。\n\n"
-                          "支持全网断点续传、无限重试、智能后台缓存隔离及代理隧道穿越。\n\n"
+                          "基于 yt-dlp、FFmpeg、抖音与视频号专用解析引擎驱动。\n\n"
+                          "支持全网断点续传、无限重试、智能后台缓存隔离、抖音无水印图集/视频与视频号本地解密。\n\n"
                           "Designed for Professional Video Editors.")
 
     def check_clipboard(self):
@@ -519,6 +651,15 @@ class MainWindow(QMainWindow):
         if text == self._last_clipboard_text:
             return
         self._last_clipboard_text = text
+
+        # 🌟 智能提纯抖音分享文本
+        if douyin_extractor.is_douyin_url(text):
+            clean = douyin_extractor.clean_douyin_url(text)
+            if clean and self.ui.url_input.text() != clean:
+                self.ui.url_input.setText(clean)
+                self.update_log(f"📋 检测到剪切板包含抖音分享内容，已自动提纯: {clean}")
+            return
+
         if text.startswith("http://") or text.startswith("https://"):
             if self.ui.url_input.text() != text:
                 self.ui.url_input.setText(text)
@@ -551,6 +692,12 @@ class MainWindow(QMainWindow):
         url = self.ui.url_input.text().strip()
         self.ui.url_input.clear()
         if not url: return
+
+        # 抖音链接提纯
+        if douyin_extractor.is_douyin_url(url):
+            clean_url = douyin_extractor.clean_douyin_url(url)
+            if clean_url:
+                url = clean_url
 
         # 系列 / 播放列表：先让用户选择“整个系列”还是“仅当前视频”
         if looks_like_playlist(url):
