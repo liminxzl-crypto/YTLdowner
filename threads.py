@@ -372,6 +372,38 @@ class InfoThread(QThread):
                 })
                 return
 
+        # 🌟 JS 环境校验站点（如新片场）：腾讯云 WAF + 自研前端风控会先返回
+        # 403/406 挑战页，必须由浏览器执行 JS 才放行。纯 HTTP 请求无论带什么
+        # Cookie 都会被拦，yt-dlp 的所有策略都必然秒失败 —— 直接走浏览器嗅探，
+        # 并复用用户浏览器里已通过校验的 Cookie（含 WAF 通行凭据）。
+        if m3u8_sniffer.is_js_challenge_site(self.url):
+            self.log_signal.emit("🧱 该站点启用 JS 环境校验（WAF 反爬），常规解析必被拦截，"
+                                 "直接启用浏览器嗅探...")
+            if not m3u8_sniffer.find_browser():
+                self.log_signal.emit("⚠️ 未找到可用的 Chrome/Edge 浏览器，无法通过环境校验。")
+                self.finished_signal.emit({"url": self.url,
+                                           "title": "解析失败 (需安装 Chrome/Edge)",
+                                           "thumb": ""})
+                return
+            try:
+                result = m3u8_sniffer.sniff_m3u8(
+                    self.url, on_log=lambda m: self.log_signal.emit(m),
+                    timeout=70, proxy=_proxy_from_args(self.cookie_args),
+                    cookie_args=self.cookie_args)
+            except Exception as e:
+                result = None
+                self.log_signal.emit(f"⚠️ 嗅探异常: {e}")
+            if result and getattr(result, "m3u8_url", None):
+                M3U8_CACHE[self.url] = result
+                t = (result.title or "").strip() or "视频"
+                self.log_signal.emit(f"✅ 已锁定真实视频流: {t}")
+                self.finished_signal.emit({"url": self.url, "title": t, "thumb": ""})
+                return
+            self.log_signal.emit("❌ 未能取得该站点的视频流。")
+            self.finished_signal.emit({"url": self.url,
+                                       "title": "解析失败 (环境校验未通过)", "thumb": ""})
+            return
+
         yt_exe = get_exe_path(get_bin_name("yt-dlp"))
         if not os.path.exists(yt_exe):
             self.log_signal.emit(f"❌ 找不到引擎: {yt_exe}")
@@ -469,7 +501,7 @@ class InfoThread(QThread):
             try:
                 result = m3u8_sniffer.sniff_m3u8(
                     self.url, on_log=lambda m: self.log_signal.emit(m),
-                    timeout=45, proxy=proxy)
+                    timeout=45, proxy=proxy, cookie_args=self.cookie_args)
             except Exception as e:
                 result = None
                 self.log_signal.emit(f"⚠️ 嗅探异常: {e}")
@@ -483,7 +515,10 @@ class InfoThread(QThread):
                 return
 
         # 🌟 所有弹药打光后的终极提示
-        self.log_signal.emit("❌ 致命风控：所有 Cookie 授权方案均已失效！\n💡 请前往【设置】选择【导入本地 txt...】并提供最新导出的 Netscape 格式 cookie 文件！")
+        self.log_signal.emit("❌ 解析失败：所有 Cookie 授权方案与浏览器嗅探均未取到视频流。")
+        self.log_signal.emit("💡 若该站点有环境校验/登录墙，请先用本机浏览器（Chrome/Edge）"
+                             "正常打开该视频页面并成功播放一次，让浏览器拿到通行 Cookie；")
+        self.log_signal.emit("   或在【设置】中选择【导入本地 txt...】提供最新导出的 Netscape 格式 cookie 文件。")
         self.finished_signal.emit({"url": self.url, "title": title, "thumb": ""})
 
 # --- 2. 单个下载任务线程 ---
@@ -687,7 +722,7 @@ class SingleDownloadWorker(QThread):
         self.output_signal.emit("🛰️ 常规解析被风控拦截，启动浏览器智能嗅探真实视频流...")
         result = m3u8_sniffer.sniff_m3u8(
             self.url, on_log=lambda m: self.output_signal.emit(m),
-            timeout=50, proxy=proxy)
+            timeout=50, proxy=proxy, cookie_args=self.cookie_args)
 
         if not result or not getattr(result, "m3u8_url", None):
             self.output_signal.emit("ℹ️ 浏览器嗅探未能发现可用的 m3u8 直链。")

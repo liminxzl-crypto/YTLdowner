@@ -48,5 +48,5 @@ app = BUNDLE(
     name='YTLdowner.app',
     icon='Icon.icns',
     bundle_identifier='com.liminxzl.ytldowner',
-    version='1.4.0',
+    version='1.4.1',
 )

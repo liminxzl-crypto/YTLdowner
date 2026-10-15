@@ -387,7 +387,7 @@ class MainWindow(QMainWindow):
         self.task_widgets = {} 
         self.is_queue_running = False 
         self.running_info_threads = []
-        self.version = "1.4.0"
+        self.version = "1.4.1"
         
         self.is_force_quit = False
         self._last_clipboard_text = ""
